@@ -337,14 +337,14 @@ GO
 DECLARE @AppID INT;
 
 EXEC SubmitLoanApplication
-    @FirstName = '������',
-    @LastName = '������',
+    @FirstName = 'Масим',
+    @LastName = 'Максимов',
     @Email = 'maksim@example.com',
     @Phone = '+79611234567',
     @CreditScore = 700,
     @LoanAmount = 11000,
     @LoanTerm = 25,
-    @Purpose = '������ �����',
+    @Purpose = 'Личные нужды',
     @ApplicationID = @AppID OUTPUT;
 
 SELECT * FROM LoanApplications WHERE ApplicationID = 3;
