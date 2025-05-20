@@ -18,10 +18,13 @@ CREATE TABLE LoanApplications (
     ClientID INT NOT NULL,
     ApplicationDate DATETIME DEFAULT GETDATE(),
     Status NVARCHAR(20) NOT NULL DEFAULT 'Submitted',
-    ApplicationDetails NVARCHAR(MAX) NOT NULL,
+    LoanAmount DECIMAL(18,2) NOT NULL,
+    LoanTerm INT NOT NULL,
+    Purpose NVARCHAR(100) NOT NULL,
     CONSTRAINT FK_Client FOREIGN KEY (ClientID) REFERENCES Clients(ClientID),
     CONSTRAINT CHK_Status CHECK (Status IN ('Submitted', 'Processing', 'Approved', 'Rejected')),
-    CONSTRAINT CHK_ApplicationDetails CHECK (ISJSON(ApplicationDetails) = 1)
+    CONSTRAINT CHK_LoanAmount CHECK (LoanAmount > 0),
+    CONSTRAINT CHK_LoanTerm CHECK (LoanTerm > 0)
 );
 
 -- Таблица для логов�
