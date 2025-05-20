@@ -99,9 +99,7 @@ CREATE OR ALTER PROCEDURE SubmitLoanApplication
     @Email NVARCHAR(100),
     @Phone NVARCHAR(20),
     @CreditScore INT,
-    @LoanAmount DECIMAL(18,2),
-    @LoanTerm INT,
-    @Purpose NVARCHAR(100),
+    @LoanDetails NVARCHAR(MAX), 
     @ApplicationID INT OUTPUT
 AS
 BEGIN
@@ -109,8 +107,24 @@ BEGIN
     DECLARE @ClientID INT;
     DECLARE @ConversationHandle UNIQUEIDENTIFIER;
     DECLARE @ErrorMessage NVARCHAR(4000);
+    DECLARE @LoanAmount DECIMAL(18,2);
+    DECLARE @LoanTerm INT;
+    DECLARE @Purpose NVARCHAR(100);
     BEGIN TRY
+        BEGIN TRY
+            SET @LoanAmount = JSON_VALUE(@LoanDetails, '$.loanAmount');
+            SET @LoanTerm = JSON_VALUE(@LoanDetails, '$.loanTerm');
+            SET @Purpose = JSON_VALUE(@LoanDetails, '$.purpose');
+        END TRY
+        BEGIN CATCH
+            INSERT INTO ApplicationLogs (LogType, LogMessage, Details)
+            VALUES ('Validation', 'Invalid JSON format', @LoanDetails);  
+            RAISERROR('Invalid JSON format for loan details.', 16, 1);
+            RETURN;
+        END CATCH
         BEGIN TRANSACTION;
+
+        -- Валидация данных
         IF @CreditScore < 300 OR @CreditScore > 850
         BEGIN
             INSERT INTO ApplicationLogs (LogType, LogMessage, Details)
@@ -118,7 +132,7 @@ BEGIN
                    'CreditScore: ' + CAST(@CreditScore AS NVARCHAR(10)));  
             RAISERROR('Invalid credit score. Must be between 300 and 850.', 16, 1);
             RETURN;
-        END        
+        END           
         IF @LoanAmount <= 0 OR @LoanTerm <= 0
         BEGIN
             INSERT INTO ApplicationLogs (LogType, LogMessage, Details)
@@ -127,7 +141,9 @@ BEGIN
                    ', Term: ' + CAST(@LoanTerm AS NVARCHAR(10)));
             RAISERROR('Loan amount and term must be positive values.', 16, 1);
             RETURN;
-        END
+        END   
+
+        -- Обновление или добавление клиента
         MERGE INTO Clients AS target
         USING (SELECT @Email AS Email) AS source
         ON target.Email = source.Email
@@ -139,36 +155,25 @@ BEGIN
                 CreditScore = @CreditScore
         WHEN NOT MATCHED THEN
             INSERT (FirstName, LastName, Email, Phone, CreditScore)
-            VALUES (@FirstName, @LastName, @Email, @Phone, @CreditScore);
+            VALUES (@FirstName, @LastName, @Email, @Phone, @CreditScore);        
         SET @ClientID = SCOPE_IDENTITY();
         IF @ClientID IS NULL
-            SELECT @ClientID = ClientID FROM Clients WHERE Email = @Email;
+            SELECT @ClientID = ClientID FROM Clients WHERE Email = @Email;   
         INSERT INTO ApplicationLogs (LogType, LogMessage, Details)
         VALUES ('Client', 'Client data processed', 
                'ClientID: ' + CAST(@ClientID AS NVARCHAR(10)) + 
-               ', Email: ' + @Email);
-        INSERT INTO LoanApplications (ClientID, ApplicationDetails)
-        VALUES (
-            @ClientID,
-            JSON_MODIFY(
-                JSON_MODIFY(
-                    JSON_MODIFY(
-                        JSON_MODIFY(
-                            '{}',
-                            '$.loanAmount', @LoanAmount
-                        ),
-                        '$.termDays', @LoanTerm
-                    ),
-                    '$.purpose', @Purpose
-                ),
-                '$.creditScore', @CreditScore
-            )
-        );
+               ', Email: ' + @Email);               
+
+        -- Добавление заявки 
+        INSERT INTO LoanApplications (ClientID, LoanAmount, LoanTerm, Purpose)
+        VALUES (@ClientID, @LoanAmount, @LoanTerm, @Purpose);    
         SET @ApplicationID = SCOPE_IDENTITY();
         INSERT INTO ApplicationLogs (ApplicationID, LogType, LogMessage, Details)
         VALUES (@ApplicationID, 'Application', 'New application submitted', 
                'LoanAmount: ' + CAST(@LoanAmount AS NVARCHAR(20)) + 
-               ', TermDays: ' + CAST(@LoanTerm AS NVARCHAR(10)));
+               ', Term: ' + CAST(@LoanTerm AS NVARCHAR(10)));  
+			   
+        -- Отправка сообщения в Service Broker
         BEGIN DIALOG @ConversationHandle
         FROM SERVICE [LoanApplicationService]
         TO SERVICE 'LoanApplicationService'
@@ -176,9 +181,9 @@ BEGIN
         WITH ENCRYPTION = OFF;
         SEND ON CONVERSATION @ConversationHandle
         MESSAGE TYPE [LoanApplicationMessage]
-        ('<ApplicationID>' + CAST(@ApplicationID AS NVARCHAR(10)) + '</ApplicationID>');
+        ('<ApplicationID>' + CAST(@ApplicationID AS NVARCHAR(10)) + '</ApplicationID>');     
         INSERT INTO ApplicationLogs (ApplicationID, LogType, LogMessage)
-        VALUES (@ApplicationID, 'ServiceBroker', 'Message sent to Service Broker');
+        VALUES (@ApplicationID, 'ServiceBroker', 'Message sent to Service Broker');       
         COMMIT TRANSACTION;
         SELECT @ApplicationID AS ApplicationID, 'Submitted' AS Status;
     END TRY
@@ -205,13 +210,15 @@ BEGIN
     DECLARE @MessageTypeName NVARCHAR(256);
     DECLARE @ApplicationID INT;
     DECLARE @LoanAmount DECIMAL(18,2);
-    DECLARE @TermDays INT;
+    DECLARE @LoanTerm INT;
     DECLARE @CreditScore INT;
     DECLARE @Status NVARCHAR(20);
     DECLARE @ClientID INT;
+    DECLARE @OldStatus NVARCHAR(20);
     DECLARE @ErrorMessage NVARCHAR(4000);
     DECLARE @ErrorSeverity INT;
     DECLARE @ErrorState INT;
+    DECLARE @ChangeReason NVARCHAR(255);    
     BEGIN TRY
         WHILE 1=1
         BEGIN
@@ -222,14 +229,14 @@ BEGIN
                     @MessageBody = message_body,
                     @MessageTypeName = message_type_name
                 FROM LoanApplicationQueue
-            ), TIMEOUT 1000;   
+            ), TIMEOUT 1000;               
             IF @@ROWCOUNT = 0
             BEGIN
                 COMMIT TRANSACTION;
                 BREAK;
-            END
+            END           
             INSERT INTO ApplicationLogs (ApplicationID, LogType, LogMessage)
-            VALUES (NULL, 'Info', 'Message received from Service Broker');
+            VALUES (NULL, 'Info', 'Message received from Service Broker');           
             IF @MessageTypeName = 'http://schemas.microsoft.com/SQL/ServiceBroker/EndDialog'
             BEGIN
                 INSERT INTO ApplicationLogs (LogType, LogMessage)
@@ -239,26 +246,35 @@ BEGIN
             ELSE IF @MessageTypeName = 'LoanApplicationMessage'
             BEGIN
                 BEGIN TRY
-                    SET @ApplicationID = @MessageBody.value('(/ApplicationID)[1]', 'INT');      
+                    SET @ApplicationID = @MessageBody.value('(/ApplicationID)[1]', 'INT');                         
                     INSERT INTO ApplicationLogs (ApplicationID, LogType, LogMessage)
-                    VALUES (@ApplicationID, 'Info', 'Start processing application');
+                    VALUES (@ApplicationID, 'Info', 'Start processing application');                  
                     SELECT 
-                        @LoanAmount = JSON_VALUE(ApplicationDetails, '$.loanAmount'),
-                        @TermDays = JSON_VALUE(ApplicationDetails, '$.termDays'),
-                        @ClientID = ClientID
+                        @LoanAmount = LoanAmount,
+                        @LoanTerm = LoanTerm,
+                        @ClientID = ClientID,
+                        @OldStatus = Status
                     FROM LoanApplications
-                    WHERE ApplicationID = @ApplicationID;
+                    WHERE ApplicationID = @ApplicationID;                  
                     SELECT @CreditScore = CreditScore
                     FROM Clients
-                    WHERE ClientID = @ClientID;
+                    WHERE ClientID = @ClientID;                    
                     UPDATE LoanApplications
                     SET Status = 'Processing'
-                    WHERE ApplicationID = @ApplicationID;
+                    WHERE ApplicationID = @ApplicationID;             
+                    EXEC LogStatusChange 
+                        @ApplicationID = @ApplicationID,
+                        @OldStatus = @OldStatus,
+                        @NewStatus = 'Processing',
+                        @ChangeReason = 'Started processing';                    
+                    DECLARE @ProcessingDetails NVARCHAR(500) = 
+                        'LoanAmount: ' + CAST(@LoanAmount AS NVARCHAR(20)) + 
+                        ', Term: ' + CAST(@LoanTerm AS NVARCHAR(10)) + 
+                        ', CreditScore: ' + CAST(@CreditScore AS NVARCHAR(10));
+                    
                     INSERT INTO ApplicationLogs (ApplicationID, LogType, LogMessage, Details)
-                    VALUES (@ApplicationID, 'Info', 'Application status changed to Processing', 
-                           'LoanAmount: ' + CAST(@LoanAmount AS NVARCHAR(20)) + 
-                           ', TermDays: ' + CAST(@TermDays AS NVARCHAR(10)) + 
-                           ', CreditScore: ' + CAST(@CreditScore AS NVARCHAR(10)));
+                    VALUES (@ApplicationID, 'Info', 'Application processing', @ProcessingDetails);
+                    
                     IF @CreditScore > 600 AND @LoanAmount < 10000
                     BEGIN
                         SET @Status = 'Approved';
@@ -266,23 +282,35 @@ BEGIN
                     ELSE
                     BEGIN
                         SET @Status = 'Rejected';
-                    END
+                    END                   
                     UPDATE LoanApplications
                     SET Status = @Status
-                    WHERE ApplicationID = @ApplicationID;
+                    WHERE ApplicationID = @ApplicationID;                   
+                    EXEC LogStatusChange 
+                        @ApplicationID = @ApplicationID,
+                        @OldStatus = 'Processing',
+                        @NewStatus = @Status,
+                        @ChangeReason = 'Automated decision';                 
                     INSERT INTO ApplicationLogs (ApplicationID, LogType, LogMessage)
                     VALUES (@ApplicationID, 'Info', 'Application processed. Status: ' + @Status);    
                 END TRY
                 BEGIN CATCH
                     SET @ErrorMessage = ERROR_MESSAGE();
                     SET @ErrorSeverity = ERROR_SEVERITY();
-                    SET @ErrorState = ERROR_STATE();      
+                    SET @ErrorState = ERROR_STATE();          
                     INSERT INTO ApplicationLogs (ApplicationID, LogType, LogMessage, Details)
                     VALUES (@ApplicationID, 'Error', 'Error processing application', @ErrorMessage);
+                    
                     UPDATE LoanApplications
                     SET Status = 'Rejected'
                     WHERE ApplicationID = @ApplicationID;
-                END CATCH
+                    SET @ChangeReason = 'Error during processing: ' + @ErrorMessage;                 
+                    EXEC LogStatusChange 
+                        @ApplicationID = @ApplicationID,
+                        @OldStatus = 'Processing',
+                        @NewStatus = 'Rejected',
+                        @ChangeReason = @ChangeReason;
+                END CATCH   
                 END CONVERSATION @ConversationHandle;
             END
             ELSE
@@ -307,27 +335,24 @@ BEGIN
 END;
 GO
 
--- 5. Триггер для автоматического логирования изменений статуса
+-- 5. Хранимая процедура для логирования изменений статуса
 -----------------------------------------------------------------------------
 
-CREATE OR ALTER TRIGGER TR_LoanApplications_StatusChange
-ON LoanApplications
-AFTER UPDATE
+CREATE OR ALTER PROCEDURE LogStatusChange
+    @ApplicationID INT,
+    @OldStatus NVARCHAR(20),
+    @NewStatus NVARCHAR(20),
+    @ChangeReason NVARCHAR(255) = NULL
 AS
 BEGIN
-    SET NOCOUNT ON;   
-    IF UPDATE(Status)
-    BEGIN
-        INSERT INTO ApplicationStatusHistory (ApplicationID, OldStatus, NewStatus, ChangeReason)
-        SELECT 
-            i.ApplicationID,
-            d.Status,
-            i.Status,
-            'Automated processing'
-        FROM inserted i
-        JOIN deleted d ON i.ApplicationID = d.ApplicationID
-        WHERE i.Status <> d.Status;
-    END
+    SET NOCOUNT ON;
+    INSERT INTO ApplicationStatusHistory (ApplicationID, OldStatus, NewStatus, ChangeReason)
+    VALUES (@ApplicationID, @OldStatus, @NewStatus, @ChangeReason);
+    
+    INSERT INTO ApplicationLogs (ApplicationID, LogType, LogMessage, Details)
+    VALUES (@ApplicationID, 'StatusChange', 
+           'Status changed from ' + ISNULL(@OldStatus, 'NULL') + ' to ' + @NewStatus,
+           @ChangeReason);
 END;
 GO
 
